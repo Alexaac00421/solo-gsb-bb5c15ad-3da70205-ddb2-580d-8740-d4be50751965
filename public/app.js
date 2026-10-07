@@ -444,6 +444,154 @@ function renderPermits() {
 window.endPermit = (id) => mutate('POST', `/api/permits/${id}/end`, {});
 
 // ---------------------------------------------------------------------------
+// 单点挂牌失效风险报告(只读): 可按许可编号筛选, 路径可在图上查看
+// ---------------------------------------------------------------------------
+state.risk = {
+  mode: 'all',       // 'all' 全部有效许可 | 'pick' 勾选子集
+  pickedIds: new Set(),
+  report: null       // 最近一次报告(含 400/404 时为 null)
+};
+
+function renderRiskPermits() {
+  const box = $('riskPermits');
+  if (!box) return;
+  const snap = state.snapshot;
+  if (!snap) return;
+  if (!snap.permits.length) {
+    state.risk.mode = 'all';
+    box.innerHTML = '<span class="hint">当前没有有效检修许可。</span>';
+    return;
+  }
+  const allChecked = state.risk.mode === 'all';
+  // 许可结束后自动剔除已失效的勾选, 避免再次请求时引用非有效编号;
+  // 若因此(或手动取消)变为空选择, 保留 pick 模式: 点击生成时由后端按
+  // “显式空组拒绝”返回错误提示, 与 API 契约一致。
+  const validIds = new Set(snap.permits.map((p) => p.id));
+  for (const id of [...state.risk.pickedIds]) {
+    if (!validIds.has(id)) state.risk.pickedIds.delete(id);
+  }
+  const html = [`<label class="risk-check"><input type="radio" name="riskMode" value="all" ${allChecked ? 'checked' : ''}>
+      <span><b>全部有效许可</b><small>${snap.permits.length} 张</small></span></label>`];
+  for (const p of snap.permits) {
+    const checked = !allChecked && state.risk.pickedIds.has(p.id);
+    html.push(`<label class="risk-check">
+      <input type="checkbox" data-risk-permit="${p.id}" ${checked ? 'checked' : ''}>
+      <span><b>许可 #${p.id} · ${escapeHtml(p.device_name)}</b><small>设备 #${p.device_id}</small></span>
+    </label>`);
+  }
+  box.innerHTML = html.join('');
+  box.querySelector('input[name="riskMode"]').addEventListener('change', () => {
+    state.risk.mode = 'all';
+    renderRiskPermits();
+  });
+  box.querySelectorAll('[data-risk-permit]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = parseInt(input.dataset.riskPermit, 10);
+      // 任一个别许可被勾选即进入“按编号筛选”模式; 显式空组由后端拒绝
+      state.risk.mode = 'pick';
+      if (input.checked) state.risk.pickedIds.add(id);
+      else state.risk.pickedIds.delete(id);
+      renderRiskPermits();
+    });
+  });
+}
+
+function renderRiskReport() {
+  const box = $('riskReport');
+  if (!box) return;
+  const r = state.risk.report;
+  if (!r) return; // 保留初始提示文案
+  const stale = state.snapshot && r.revision !== state.snapshot.revision;
+
+  if (r.checkedPermitCount === 0) {
+    box.innerHTML = `<div class="risk-empty">报告基于修订号 <b>${r.revision}</b>：当前没有有效许可，返回空报告
+      （已挂牌开关 ${r.taggedSwitchCount} 个；空报告不逐项列出）。</div>`;
+    return;
+  }
+  if (!r.taggedSwitchCount) {
+    box.innerHTML = `<div class="risk-empty">报告基于修订号 <b>${r.revision}</b>：当前没有已挂牌开关
+      （所查许可 ${r.checkedPermitCount} 张：#${r.checked_permit_ids.join(', #')}）。</div>`;
+    return;
+  }
+
+  const staleBanner = stale
+    ? `<div class="advice-stale">⚠ 报告基于修订号 ${r.revision}，当前已为 ${state.snapshot.revision}；
+       路径查看仍依据报告快照，如需最新结论请重新生成。</div>` : '';
+
+  const head = `<div class="risk-head">修订号 <b>${r.revision}</b> · 已挂牌开关 <b>${r.taggedSwitchCount}</b> 个 ·
+    检查许可 <b>${r.checkedPermitCount}</b> 张（#${r.checked_permit_ids.join(', #')}）·
+    单点风险 <b class="${r.risks.length ? 'risk-bad' : 'risk-ok'}">${r.risks.length}</b> 项
+    ${stale ? '<span class="hint">（修订号已过期）</span>' : ''}</div>`;
+
+  const cards = r.switches.map((s) => {
+    const cls = s.has_single_point_risk ? 'risk-card bad' : 'risk-card ok';
+    const title = s.has_single_point_risk
+      ? `⚠ 单点失效将使 ${s.risk_permit_count} 张许可出现未切断通路`
+      : '✔ 单点失效不影响任何所查许可（无单点风险）';
+    const riskHtml = s.risks.length ? s.risks.map((x) => `
+      <div class="risk-item">
+        <div><b>许可 #${x.permit_id} · ${escapeHtml(x.device_name)}</b>（设备 #${x.device_id}）出现未切断通路：</div>
+        <a href="#" class="risk-path" data-risk-path='${JSON.stringify(x.livePath.nodes.map((n) => n.id))}'>
+          ${x.livePath.nodes.map((n) => escapeHtml(n.tagged ? `🔒${n.name}` : n.name)).join(' → ')}
+        </a>
+      </div>`).join('') : '<div class="hint">假设该开关挂牌失效后，所查许可仍全部满足隔离。</div>';
+    return `<div class="${cls}">
+      <div class="risk-switch"><b>#${s.switch_id} ${escapeHtml(s.name)}</b>
+        <span class="risk-tag ${s.has_single_point_risk ? 'risk-bad' : 'risk-ok'}">${title}</span></div>
+      ${riskHtml}
+    </div>`;
+  }).join('');
+
+  box.innerHTML = staleBanner + head + '<div class="risk-list">' + cards + '</div>';
+
+  // 点击真实带电路径: 高亮并跳到“供电网络”页查看
+  box.querySelectorAll('[data-risk-path]').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      try { state.highlightPaths = [JSON.parse(el.dataset.riskPath)]; } catch (_) { return; }
+      renderGraph();
+      document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'network'));
+      document.querySelectorAll('.tabpane').forEach((x) =>
+        x.classList.toggle('active', x.id === 'tab-network'));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  });
+}
+
+async function runRiskReport() {
+  const payload = state.risk.mode === 'pick'
+    ? { permit_ids: [...state.risk.pickedIds].sort((a, b) => a - b) }
+    : {};
+  let data;
+  try {
+    const resp = await fetch('/api/risks/single-point-tag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) {
+    return toast('单点失效风险报告请求失败', 'error');
+  }
+  if (!data.ok) {
+    state.risk.report = null;
+    const extra = data.invalid_permit_ids ? `（无效编号: ${data.invalid_permit_ids.join(', ')}）`
+      : data.duplicate_ids ? `（重复编号: ${data.duplicate_ids.join(', ')}）` : '';
+    toast(`✖ ${data.error ? data.error.message : '请求失败'}${extra}`, 'error');
+    return;
+  }
+  state.risk.report = data;
+  renderRiskReport();
+  if (data.checkedPermitCount === 0) {
+    toast(`当前没有有效许可，返回空报告（修订号 ${data.revision}）。`, 'info');
+  } else if (!data.risks.length) {
+    toast(`报告生成（修订号 ${data.revision}）：${data.taggedSwitchCount} 个已挂牌开关均无单点风险。`, 'success');
+  } else {
+    toast(`报告生成（修订号 ${data.revision}）：发现 ${data.risks.length} 项单点挂牌失效风险，点击路径可在图中查看。`, 'error');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 隔离建议: 最少新增挂牌方案(基于所给修订号, 可带入临时操作单预演/确认)
 // ---------------------------------------------------------------------------
 async function loadIsolationAdvice(deviceId) {
@@ -1088,6 +1236,8 @@ function render() {
   renderNodeDetail();
   renderIsolationList();
   renderPermits();
+  renderRiskPermits();
+  renderRiskReport();
   renderAdmin();
   renderGroupDevices();
   renderGroupPlan();
@@ -1171,6 +1321,7 @@ $('addEdgeBtn').addEventListener('click', () => {
 $('applyBtn').addEventListener('click', () => {
   mutate('POST', '/api/permits', { device_id: parseInt($('applyDevice').value, 10) });
 });
+$('riskRunBtn').addEventListener('click', runRiskReport); // 只读, 无需身份校验
 
 // 临时操作单事件
 $('orderAction').addEventListener('change', refreshOrderTargets);

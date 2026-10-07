@@ -17,6 +17,7 @@ const {
   MAX_STEPS: MAX_ORDER_STEPS
 } = require('./src/orders');
 const { planIsolation, planGroupIsolation } = require('./src/advisor');
+const { selectPermits, analyzeSinglePointTagRisk } = require('./src/risk');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -388,6 +389,78 @@ app.post('/api/isolation-group/plan', wrap((req, res) => {
     kind: 'isolationGroup.plan',
     revision,
     ...serializeGroupPlan(graph, plan)
+  });
+}));
+
+// 只读单点挂牌失效风险报告: 对每个当前已挂牌开关, 假设其挂牌失效(不再阻断
+// 供电), 其余开关与供电图保持原状, 按现有完整可达性规则检查所查有效许可
+// 哪些会重新出现未切断通路。整个报告基于同一次当前状态快照, 携带修订号;
+// 判定走无上限的完整可达性分析, 不受诊断路径展示上限影响; 只读, 不校验
+// 角色、不改变开关 / 许可 / 修订号 / 审计。
+// 筛选: body.permit_ids 省略 -> 全部有效许可; 显式空组、非正整数、重复、
+// 非有效许可编号一律拒绝(400/404); 无有效许可时返回空报告。
+app.post('/api/risks/single-point-tag', wrap((req, res) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  // 同一次快照: 图、有效许可与修订号在本次同步读取中一次性取齐, 全部假设
+  // 均在该内存快照上推演。
+  const graph = loadGraph();
+  const permits = activePermits();
+  const revision = currentRevision();
+
+  let selected;
+  try {
+    selected = selectPermits(
+      Object.prototype.hasOwnProperty.call(body, 'permit_ids') ? body.permit_ids : undefined,
+      permits
+    );
+  } catch (e) {
+    // risk.js 抛出与 OrderError 同构的鸭子类型错误, 统一转成 ApiError
+    throw new ApiError(e.status || 400, e.code, e.message,
+      e.duplicate_ids ? { duplicate_ids: e.duplicate_ids }
+        : e.invalid_permit_ids ? { invalid_permit_ids: e.invalid_permit_ids }
+          : {});
+  }
+
+  const report = analyzeSinglePointTagRisk(graph, selected);
+  const serializeRisk = (switchId, r) => ({
+    permit_id: r.permit_id,
+    device_id: r.device_id,
+    device_name: r.device_name,
+    // 一条真实带电路径(完整可达性分析的 BFS 见证), 穿过被假设失效的挂牌开关;
+    // 该开关节点仍按当前真实状态序列化为 tagged:true, 由 assumed_failed_switch 标明假设。
+    livePath: serializePath(graph, r.livePath),
+    assumed_failed_switch: switchId
+  });
+
+  res.json({
+    ok: true,
+    kind: 'risk.singlePointTag',
+    revision,
+    taggedSwitchCount: report.taggedSwitchCount,
+    checkedPermitCount: report.checkedPermitCount,
+    checked_permit_ids: selected.map((p) => p.id),
+    // 每个当前已挂牌开关一项(含未影响任何所查许可、无单点风险的开关);
+    // 无有效许可(空报告)或当前没有已挂牌开关时为空数组。
+    switches: report.switches.map((s) => ({
+      switch_id: s.switch_id,
+      name: s.name,
+      checked_permit_count: s.checked_permit_count,
+      risk_permit_count: s.risk_permit_count,
+      has_single_point_risk: s.has_single_point_risk,
+      risks: s.risks.map((r) => serializeRisk(s.switch_id, r))
+    })),
+    // 扁平化风险清单, 按开关编号、许可编号稳定排序
+    risks: report.risks.map((r) => ({
+      switch_id: r.switch_id,
+      switch_name: r.switch_name,
+      permit_id: r.permit_id,
+      device_id: r.device_id,
+      device_name: r.device_name,
+      // 一条真实带电路径(完整可达性分析的 BFS 见证), 穿过被假设失效的挂牌开关;
+      // 该开关节点仍按当前真实状态序列化为 tagged:true, 由 assumed_failed_switch 标明假设。
+      livePath: serializePath(graph, r.livePath),
+      assumed_failed_switch: r.switch_id
+    }))
   });
 }));
 
@@ -837,6 +910,7 @@ app.use((err, req, res, next) => {
     if (err.current) body.current = err.current;
     if (err.duplicate_ids) body.duplicate_ids = err.duplicate_ids;
     if (err.invalid_device_ids) body.invalid_device_ids = err.invalid_device_ids;
+    if (err.invalid_permit_ids) body.invalid_permit_ids = err.invalid_permit_ids;
     if (err.violations) body.violations = err.violations;
     if (err.livePaths) body.livePaths = err.livePaths;
     if (err.conflicts) body.conflicts = err.conflicts;

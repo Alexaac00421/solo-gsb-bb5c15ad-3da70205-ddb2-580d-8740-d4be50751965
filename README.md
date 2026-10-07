@@ -142,6 +142,33 @@ HTTP API）临时编排一张操作单：
   `withinOrderLimit:false`；整组确认返回 `400 STEPS_TOO_LONG`，不可部分执行。
 - 旧的单设备建议、临时操作单和许可接口路径与行为保持兼容；新接口是叠加能力。
 
+### 单点挂牌失效风险报告（只读诊断）
+操作员需要评估“某个挂牌点单独失效（挂牌脱落 / 被人误解除）时，哪些有效许可会
+重新带电”。在“检修许可”页可直接生成报告，也可调用
+`POST /api/risks/single-point-tag`：
+
+- 对**每个当前已挂牌开关**分别做一次假设：该开关不再阻断供电，**其余开关与
+  供电图保持原状**，然后按与许可保护完全相同的**现有完整可达性规则**
+  （多源 BFS、挂牌开关为屏障、无数量 / 长度上限）判断所查有效许可哪些会出现
+  **未切断通路**。
+- 每条风险都附一条**真实带电路径**（完整可达性分析给出的 BFS 见证路径，
+  必然穿过被假设失效的那个挂牌开关；路径中该开关仍按当前真实状态标记为
+  🔒 已挂牌，并由 `assumed_failed_switch` 字段标明它只是“被假设失效”）。
+  浏览器中点击路径即可在供电网络图上高亮查看。
+- 结果按**开关编号、许可编号稳定排序**：`switches[]` 逐开关给出，
+  `risks[]` 是扁平化的 `(开关, 许可)` 风险清单；**未影响任何所查许可的已挂牌
+  开关同样列为一项**并标记 `has_single_point_risk:false`（无单点风险）。
+- **许可编号筛选**：请求体可带 `permit_ids`。省略（或为 `null`）时检查
+  **全部有效许可**；**显式空组、重复编号、非正整数 / 非整数 / 非数字编号一律
+  `400` 拒绝**，引用非当前有效许可的编号（含已结束许可）返回 `404`。
+- **当前没有任何有效许可时返回空报告**：`checkedPermitCount:0`，
+  `switches`/`risks` 均为空。
+- 整份报告**基于同一次当前状态快照**（图、有效许可、修订号在单次请求内一次
+  取齐），响应携带该快照的 `revision`；判定**不受诊断路径展示上限（200 条 /
+  64 节点）影响**——报告完全不经过限量枚举。接口为**只读**：不需要
+  actor/role，不改变开关、许可、修订号或审计。状态在报告之后被他人推进时，
+  界面把报告标记为“修订号已过期”，重新生成即可。
+
 ### 多人并发（乐观锁）
 - 每次成功变更都会让全局 **修订号 revision + 1**（界面右上角实时显示）。
 - 所有写操作必须携带操作者“所见”的 `revision`。
@@ -230,7 +257,10 @@ cp .env.example .env
 4. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
    路径数量 / 长度超过诊断上限时，弹窗与许可卡片会用黄色提示标记“仅展示部分
    路径”，但拒绝结论基于完整可达性分析，不受上限影响。有效许可卡片实时显示
-   隔离是否满足，可随时结束许可。
+   隔离是否满足，可随时结束许可。页底“单点挂牌失效风险”面板可按许可编号
+   （或全部有效许可）生成只读报告：逐已挂牌开关假设其不再阻断供电，列出受影响
+   许可与真实带电路径，未影响所查许可的开关标为无单点风险；点击路径可在
+   “供电网络”页高亮查看；报告携带所据修订号，状态被他人推进后提示重新生成。
 5. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
 6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
@@ -263,6 +293,7 @@ cp .env.example .env
 | POST | `/api/isolation-group/plan` | - | **多设备协同方案**（只读）`{device_ids:[...]}`：返回共用开关、必要分闸挂牌步骤、许可数、总步数和所据修订号；任一目标无开关可切断时 `422` |
 | POST | `/api/isolation-group/preview` | operator | 多设备协同方案**预演**（只读，不校验/改变修订号）`{device_ids:[...]}` |
 | POST | `/api/isolation-group/confirm` | operator | 多设备协同隔离与全部许可**一次确认**（原子，revision +1，一条审计）`{device_ids:[...]}` |
+| POST | `/api/risks/single-point-tag` | - | **单点挂牌失效风险报告**（只读）`{permit_ids?:[...]}`：逐已挂牌开关假设失效，按完整可达性规则返回受影响许可与真实带电路径；省略筛选查全部有效许可，空组/重复/非法编号 `400`，非有效编号 `404`，无有效许可返回空报告；携带同快照 `revision`，不改开关/许可/修订号/审计 |
 | GET | `/api/audit?limit=100` | - | 变更记录（含前后状态快照） |
 | POST | `/api/admin/nodes` | admin | 新增节点 `{kind, name}` |
 | PATCH | `/api/admin/nodes/:id` | admin | 改名 / 启用停用电源 `{name?, enabled?}` |
@@ -445,6 +476,53 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 共用开关、每台目标由哪些新增挂牌点保护、分闸挂牌步数、许可数、确认总步数和所据
 修订号；状态被他人推进时旧方案标记为 **STALE**，不会自动替换。
 
+#### 单点挂牌失效风险报告 API 示例
+
+```bash
+# 1) 检查全部当前有效许可(省略 permit_ids; 只读, 无需 actor/role/revision)
+curl -s -X POST http://localhost:3000/api/risks/single-point-tag \
+  -H 'Content-Type: application/json' -d '{}'
+# -> 200 {
+#   ok:true, kind:"risk.singlePointTag", revision:7,
+#   taggedSwitchCount:2, checkedPermitCount:2, checked_permit_ids:[1,2],
+#   switches:[
+#     { switch_id:3, name:"进线开关K1", checked_permit_count:2,
+#       risk_permit_count:1, has_single_point_risk:true,
+#       risks:[{ permit_id:2, device_id:7, device_name:"2#引风机",
+#                assumed_failed_switch:3,
+#                livePath:{ nodes:[{id:1,...},{id:3,tagged:true,...},{id:7,...}],
+#                           edges:[1,6], blockedByTag:false } }] },
+#     { switch_id:5, name:"联络开关K3", checked_permit_count:2,
+#       risk_permit_count:1, has_single_point_risk:true, risks:[...] }
+#   ],
+#   risks:[ {switch_id:3,permit_id:2,...}, {switch_id:5,permit_id:1,...} ]  # (开关,许可) 稳定排序
+# }
+# 无单点风险的已挂牌开关也在 switches[] 中(has_single_point_risk:false, risks:[])。
+
+# 2) 只检查指定许可编号
+curl -s -X POST http://localhost:3000/api/risks/single-point-tag \
+  -H 'Content-Type: application/json' -d '{"permit_ids":[1]}'
+
+# 3) 无有效许可 -> 空报告
+# -> 200 { ok:true, revision:1, taggedSwitchCount:0, checkedPermitCount:0,
+#          checked_permit_ids:[], switches:[], risks:[] }
+
+# 4) 筛选参数拒绝
+# {"permit_ids":[]}     -> 400 PERMIT_IDS_REQUIRED（显式空组）
+# {"permit_ids":[1,1]}  -> 400 PERMIT_IDS_DUPLICATE, duplicate_ids:[1]
+# {"permit_ids":[0]}    -> 400 INVALID_PERMIT_ID（非正整数; 负数/小数/字符串/null 同理）
+# {"permit_ids":[99]}   -> 404 PERMIT_NOT_FOUND, invalid_permit_ids:[99]（非当前有效编号）
+```
+
+响应中每条 `livePath` 是一条真实的电源→设备未切断通路（BFS 见证，可超过诊断展示
+长度上限），路径穿过 `assumed_failed_switch`；路径节点上该开关仍按当前真实状态
+带 `tagged:true`，仅表示“若该挂牌单点失效则此路通电”。报告为只读：连续调用不
+改变修订号、开关、许可与审计。
+
+浏览器中的用法：进入“检修许可”页底部“单点挂牌失效风险”面板，可保持“全部有效
+许可”或勾选许可编号子集，点击“生成单点失效风险报告”；逐开关卡片标明受影响
+许可，点击真实带电路径即跳转到“供电网络”页并高亮该路径。
+
 ## 目录结构
 
 ```
@@ -456,6 +534,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 ├── src/
 │   ├── db.js               # SQLite 连接、表结构、演示数据
 │   ├── graph.js            # 完整可达性隔离判定(无上限) + 限量诊断路径枚举
+│   ├── risk.js             # 单点挂牌失效风险分析: 逐挂牌开关假设失效的只读快照推演
 │   ├── advisor.js          # 单设备/多设备隔离建议: 最小新增挂牌点割(拆点 + Dinic)
 │   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
 │   └── init-db.js          # 建库脚本(npm run init-db)
@@ -469,7 +548,9 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
     ├── advice.e2e.js       # 单设备隔离建议最少挂牌/空步骤/不可行/建议带入单据/409 回归
     ├── group.e2e.js        # 多设备协同方案/预演/一次确认/重复许可/不可行/单审计回归
     ├── advisor.test.js     # 单/多设备隔离建议单元测试(最小割、共用开关、无开关旁路等)
+    ├── risk.test.js        # 单点挂牌失效风险单元测试(逐开关失效/真实路径/无风险开关/空报告/筛选校验)
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
+    ├── risk.e2e.js         # 单点失效风险报告的 HTTP 回归(筛选拒绝/稳定排序/只读/同快照)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
 
@@ -479,6 +560,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 # 单元测试(无需起服务, 无需数据库)
 npm run test:graph
 npm run test:advisor
+npm run test:risk
 
 # 端到端冒烟(终端1 起服务, 终端2 跑测试; 使用独立 DB 避免污染演示库)
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
@@ -492,6 +574,10 @@ BASE=http://127.0.0.1:3100 node test/advice.e2e.js
 
 # 多设备协同回归(集合校验/共用开关/预演只读/整组许可/重复许可拒绝/不可行路径/单审计)
 BASE=http://127.0.0.1:3100 node test/group.e2e.js
+
+# 单点挂牌失效风险回归(空报告/筛选拒绝/真实路径/稳定排序/无风险开关/只读/同快照)
+LOTO_DB=/tmp/loto-risk-e2e.db PORT=3106 node server.js   # 终端1(或复用已启动服务)
+BASE=http://127.0.0.1:3106 node test/risk.e2e.js         # 终端2
 
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js

@@ -239,3 +239,34 @@ details.snapshot pre {
 }
 .shared-tag { color: #047857; font-weight: 700; }
 #groupResult { margin-top: 10px; }
+
+/* 单点挂牌失效风险报告 */
+#riskPanel { margin-top: 18px; }
+.risk-permits {
+  display: grid; gap: 6px; margin-top: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+}
+.risk-check {
+  display: flex; align-items: center; gap: 8px; border: 1px solid #e5e7eb;
+  border-radius: 8px; padding: 6px 10px; background: #f9fafb; cursor: pointer;
+}
+.risk-check small { display: block; color: #64748b; margin-top: 2px; }
+.risk-report { margin-top: 12px; }
+.risk-empty {
+  border: 1px dashed #cbd5e1; border-radius: 8px; padding: 10px 12px;
+  background: #f8fafc; font-size: 13px; color: #475569;
+}
+.risk-head { font-size: 13px; color: #334155; margin: 6px 0 10px; }
+.risk-ok { color: #047857; }
+.risk-bad { color: #b91c1c; }
+.risk-list { display: flex; flex-direction: column; gap: 8px; }
+.risk-card { border-radius: 8px; padding: 10px 12px; border: 1px solid #cbd5e1; background: #f8fafc; }
+.risk-card.ok { border-color: #6ee7b7; background: #f0fdf4; }
+.risk-card.bad { border-color: #fda4af; background: #fff1f2; }
+.risk-switch { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.risk-tag { font-size: 12px; font-weight: 700; }
+.risk-item { margin-top: 6px; font-size: 13px; }
+a.risk-path {
+  display: block; margin-top: 3px; font-family: ui-monospace, monospace; font-size: 12px;
+  color: #9a3412; word-break: break-all; text-decoration: underline; cursor: pointer;
+}
