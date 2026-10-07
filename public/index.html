@@ -67,6 +67,20 @@
         </div>
         <p class="hint">仅当所有启用电源到目标设备的供电路径都经过已挂牌开关时，许可才生效。申请失败将列出未切断路径。</p>
       </div>
+
+      <!-- 单点挂牌失效风险 -->
+      <div class="panel" id="tagRiskPanel">
+        <h3>单点挂牌失效风险（有效许可）</h3>
+        <p class="hint">对每个已挂牌开关分别假设其挂牌失效（不再阻断供电），其余开关与供电图保持原状，
+          按完整可达性规则检查哪些有效许可会重新出现未切断通路，并给出一条真实带电路径。
+          报告基于同一次当前状态快照、携带修订号；只读，不改变开关、许可、修订号或审计。</p>
+        <div id="tagRiskPermits" class="device-check-grid"></div>
+        <div class="form-row" style="margin-top:10px">
+          <button id="tagRiskBtn" class="btn btn-primary">生成风险报告</button>
+          <span class="hint">默认检查全部有效许可；取消勾选可只检查部分许可。</span>
+        </div>
+        <div id="tagRiskResult" class="tagrisk-result"></div>
+      </div>
     </section>
 
     <!-- 临时操作单 -->

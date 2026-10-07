@@ -17,6 +17,7 @@ const {
   MAX_STEPS: MAX_ORDER_STEPS
 } = require('./src/orders');
 const { planIsolation, planGroupIsolation } = require('./src/advisor');
+const { singlePointTagRisk } = require('./src/tagrisk');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -388,6 +389,78 @@ app.post('/api/isolation-group/plan', wrap((req, res) => {
     kind: 'isolationGroup.plan',
     revision,
     ...serializeGroupPlan(graph, plan)
+  });
+}));
+
+// 只读: 有效许可的“单点挂牌失效”风险报告。
+// 对每个当前已挂牌开关, 分别假设其挂牌失效(不再阻断供电), 其余开关状态与供电图
+// 保持原状, 按与许可生效判定相同的完整可达性规则判断哪些所查有效许可会出现
+// 未切断通路; 每项风险附一条真实带电路径(BFS 见证路径, 不受诊断展示上限影响)。
+// 省略 permit_ids 时检查全部有效许可; 显式空组 / 重复 / 非正整数 / 非有效编号拒绝。
+// 整份报告基于同一次当前状态快照(同一读事务)并携带修订号; 不校验身份,
+// 不改变开关、许可、修订号或审计。
+app.post('/api/permits/tag-risk', wrap((req, res) => {
+  // 同一次当前状态快照: 图、有效许可、修订号取自同一读事务
+  const snap = db.transaction(() => ({
+    graph: loadGraph(),
+    permits: activePermits(),
+    revision: currentRevision()
+  }))();
+  const { graph, permits, revision } = snap;
+
+  const raw = req.body ? req.body.permit_ids : undefined;
+  let targets = permits;
+  if (raw !== undefined && raw !== null) {
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new ApiError(400, 'PERMIT_IDS_REQUIRED',
+        'permit_ids 必须是非空许可编号数组(省略该字段时检查全部有效许可)');
+    }
+    const ids = [];
+    for (const value of raw) {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+        throw new ApiError(400, 'INVALID_PERMIT_ID', `许可编号无效: ${JSON.stringify(value)}`);
+      }
+      ids.push(value);
+    }
+    const duplicates = ids.filter((id, i) => ids.indexOf(id) !== i);
+    if (duplicates.length > 0) {
+      throw new ApiError(400, 'PERMIT_IDS_DUPLICATE',
+        `许可编号集合不能重复: ${[...new Set(duplicates)].join(', ')}`,
+        { duplicate_ids: [...new Set(duplicates)] });
+    }
+    const activeById = new Map(permits.map((p) => [p.id, p]));
+    const invalid = ids.filter((id) => !activeById.has(id));
+    if (invalid.length > 0) {
+      throw new ApiError(404, 'PERMIT_NOT_FOUND',
+        `许可编号不存在或不是有效许可: ${invalid.join(', ')}`,
+        { invalid_permit_ids: invalid });
+    }
+    targets = ids.map((id) => activeById.get(id)).sort((a, b) => a.id - b.id);
+  }
+
+  const report = singlePointTagRisk(graph, targets);
+  const switches = report.switches.map((sw) => ({
+    switch_id: sw.switch_id,
+    name: sw.name,
+    risks: sw.risks.map((r) => ({
+      permit_id: r.permit_id,
+      device_id: r.device_id,
+      device_name: r.device_name,
+      livePath: serializePath(graph, r.livePath)
+    }))
+  }));
+  res.json({
+    ok: true,
+    kind: 'permit.tagRisk',
+    revision,
+    // 实际检查的许可(筛选后, 按许可编号升序); 无有效许可时为空报告
+    permit_ids: targets.map((p) => p.id),
+    permits: targets.map((p) => ({
+      permit_id: p.id, device_id: p.device_id, device_name: p.device_name
+    })),
+    taggedSwitchCount: switches.length,
+    riskCount: switches.reduce((sum, sw) => sum + sw.risks.length, 0),
+    switches
   });
 }));
 

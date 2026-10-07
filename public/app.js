@@ -21,6 +21,10 @@ const state = {
     result: null,
     kind: null,
     stale: false
+  },
+  tagRisk: {
+    excluded: new Set(), // 生成报告时被排除的有效许可 id(默认全选=检查全部)
+    report: null         // 最近一次单点挂牌失效风险报告
   }
 };
 
@@ -442,6 +446,117 @@ function renderPermits() {
 }
 
 window.endPermit = (id) => mutate('POST', `/api/permits/${id}/end`, {});
+
+// ---------------------------------------------------------------------------
+// 单点挂牌失效风险报告(只读): 筛选许可 + 查看真实带电路径
+// ---------------------------------------------------------------------------
+function renderTagRiskPermits() {
+  const box = $('tagRiskPermits');
+  if (!box) return;
+  const snap = state.snapshot;
+  if (!snap || !snap.permits.length) {
+    box.innerHTML = '<p class="hint">当前没有有效检修许可，报告为空。</p>';
+    return;
+  }
+  // 勾选状态保存在 state.tagRisk.excluded, 渲染不丢选择
+  box.innerHTML = snap.permits.map((p) => `<label class="device-check has-permit">
+    <input type="checkbox" data-tagrisk-permit="${p.id}"
+      ${state.tagRisk.excluded.has(p.id) ? '' : 'checked'}>
+    <span><b>许可 #${p.id} ${escapeHtml(p.device_name)}</b><small>申请人：${escapeHtml(p.requested_by)}</small></span>
+  </label>`).join('');
+  box.querySelectorAll('[data-tagrisk-permit]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = parseInt(input.dataset.tagriskPermit, 10);
+      if (input.checked) state.tagRisk.excluded.delete(id);
+      else state.tagRisk.excluded.add(id);
+    });
+  });
+}
+
+function renderTagRiskResult() {
+  const box = $('tagRiskResult');
+  if (!box) return;
+  const r = state.tagRisk.report;
+  if (!r) {
+    box.innerHTML = '';
+    return;
+  }
+  const staleNote = state.snapshot && r.revision !== state.snapshot.revision
+    ? `<div class="advice-stale">⚠ 报告基于修订号 ${r.revision}，当前已为 ${state.snapshot.revision}；状态可能已变化，请重新生成。</div>`
+    : '';
+  const head = `<div class="advice-msg">报告修订号 <b>${r.revision}</b> · 检查许可 <b>${r.permit_ids.length}</b> 张
+    （${r.permit_ids.join(', #') ? '#' + r.permit_ids.join(', #') : '无'}）· 已挂牌开关 <b>${r.taggedSwitchCount}</b> 个 ·
+    单点风险 <b>${r.riskCount}</b> 项<span class="tagrisk-rev">同一次当前状态快照 · 只读</span></div>`;
+
+  if (!r.permit_ids.length) {
+    box.innerHTML = staleNote + head
+      + '<div class="tagrisk-card ok">空报告：当前没有有效检修许可，无需分析单点挂牌失效风险。</div>';
+    return;
+  }
+  if (!r.switches.length) {
+    box.innerHTML = staleNote + head
+      + '<div class="tagrisk-card ok">当前没有已挂牌开关，无单点挂牌失效风险。</div>';
+    return;
+  }
+  const cards = r.switches.map((sw) => {
+    if (!sw.risks.length) {
+      return `<div class="tagrisk-card ok"><b>#${sw.switch_id} ${escapeHtml(sw.name)}</b>：
+        ✔ 无单点风险——即使该开关挂牌失效，所查许可仍保持断电隔离。</div>`;
+    }
+    const risks = sw.risks.map((risk, i) => `<div class="tagrisk-risk">
+      ✖ 许可 #${risk.permit_id}（${escapeHtml(risk.device_name)}）将失去隔离：
+      <span class="path-line tagrisk-path" data-tagrisk-path="${sw.switch_id}:${i}"
+        title="点击在供电网络图中高亮该路径">${
+        risk.livePath.nodes.map((n) => escapeHtml(n.name)).join(' → ')}</span>
+    </div>`).join('');
+    return `<div class="tagrisk-card bad"><b>#${sw.switch_id} ${escapeHtml(sw.name)}</b>：
+      假设该开关挂牌失效，${sw.risks.length} 张许可出现未切断通路（真实带电路径）：${risks}</div>`;
+  }).join('');
+  box.innerHTML = staleNote + head + cards;
+
+  box.querySelectorAll('[data-tagrisk-path]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const [swId, idx] = el.dataset.tagriskPath.split(':').map((x) => parseInt(x, 10));
+      const sw = state.tagRisk.report.switches.find((s) => s.switch_id === swId);
+      const risk = sw && sw.risks[idx];
+      if (!risk) return;
+      state.highlightPaths = [risk.livePath.nodes.map((n) => n.id)];
+      renderGraph();
+      toast(`已在“供电网络”页高亮：开关 #${swId} 挂牌失效后许可 #${risk.permit_id} 的带电路径。`, 'info');
+    });
+  });
+}
+
+async function tagRiskReport() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const activeIds = snap.permits.map((p) => p.id);
+  const checked = activeIds.filter((id) => !state.tagRisk.excluded.has(id));
+  const payload = {};
+  // 全部勾选 = 省略 permit_ids(检查全部有效许可); 部分勾选 = 显式子集
+  if (activeIds.length && checked.length !== activeIds.length) {
+    if (!checked.length) {
+      return toast('请至少勾选一个有效许可（或重新勾选全部以检查全部许可）', 'error');
+    }
+    payload.permit_ids = checked;
+  }
+  const r = await fetch('/api/permits/tag-risk', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    return toast(`✖ ${data.error ? data.error.message : '风险报告请求失败'}`, 'error');
+  }
+  state.tagRisk.report = data;
+  renderTagRiskResult();
+  toast(data.riskCount
+    ? `报告已生成（修订号 ${data.revision}）：${data.riskCount} 项单点挂牌失效风险，点击路径可在图中高亮。`
+    : `报告已生成（修订号 ${data.revision}）：所查许可均无单点挂牌失效风险。`,
+    data.riskCount ? 'error' : 'success');
+}
+
 
 // ---------------------------------------------------------------------------
 // 隔离建议: 最少新增挂牌方案(基于所给修订号, 可带入临时操作单预演/确认)
@@ -1088,6 +1203,8 @@ function render() {
   renderNodeDetail();
   renderIsolationList();
   renderPermits();
+  renderTagRiskPermits();
+  renderTagRiskResult();
   renderAdmin();
   renderGroupDevices();
   renderGroupPlan();
@@ -1171,6 +1288,7 @@ $('addEdgeBtn').addEventListener('click', () => {
 $('applyBtn').addEventListener('click', () => {
   mutate('POST', '/api/permits', { device_id: parseInt($('applyDevice').value, 10) });
 });
+$('tagRiskBtn').addEventListener('click', tagRiskReport);
 
 // 临时操作单事件
 $('orderAction').addEventListener('change', refreshOrderTargets);

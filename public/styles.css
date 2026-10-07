@@ -239,3 +239,22 @@ details.snapshot pre {
 }
 .shared-tag { color: #047857; font-weight: 700; }
 #groupResult { margin-top: 10px; }
+
+/* 单点挂牌失效风险报告 */
+#tagRiskPanel { margin-top: 14px; }
+.tagrisk-result { margin-top: 10px; }
+.tagrisk-card {
+  border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px;
+  background: #f8fafc; margin-top: 8px; font-size: 13px;
+}
+.tagrisk-card.ok { border-color: #6ee7b7; background: #f0fdf4; }
+.tagrisk-card.bad { border-color: #fda4af; background: #fff1f2; }
+.tagrisk-risk {
+  border-radius: 6px; padding: 5px 8px; margin-top: 6px;
+  background: rgba(255,255,255,.8);
+}
+.tagrisk-path {
+  cursor: pointer; color: #9a3412;
+}
+.tagrisk-path:hover { text-decoration: underline; }
+.tagrisk-rev { float: right; font-size: 12px; color: #64748b; font-weight: 400; }

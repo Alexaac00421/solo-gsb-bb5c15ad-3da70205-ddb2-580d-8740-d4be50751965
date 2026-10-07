@@ -115,6 +115,23 @@ HTTP API）临时编排一张操作单：
 - 建议接口为**只读**：不校验角色、不改变修订号与审计；既有的角色、逐步状态机、
   事务回滚与审计约定全部继续适用（确认仍走 `/api/orders/confirm`）。
 
+### 有效许可的单点挂牌失效风险
+操作员可查看**每张有效许可的隔离是否单独依赖某一块挂牌**（单点失效风险）：
+
+- `POST /api/permits/tag-risk`（只读）对**每个当前已挂牌开关**分别假设其挂牌失效
+  （不再阻断供电），其余开关状态与供电图保持原状，按与许可生效判定相同的
+  **完整可达性规则**判断哪些有效许可会重新出现未切断通路。
+- 可选 `permit_ids` 筛选要检查的许可；**省略时检查全部有效许可**。显式空组、
+  重复编号、非正整数返回 `400`，引用不存在或已结束的许可编号返回 `404`。
+- 结果按**开关编号、许可编号稳定排序**；每项风险附**一条真实带电路径**
+  （完整可达性分析的 BFS 见证路径，**不受诊断路径 200 条 / 64 节点展示上限影响**）。
+- **未影响任何所查许可的已挂牌开关也须列出**（`risks` 为空，标记无单点风险）；
+  **没有有效许可时返回空报告**（`switches` 为空）。
+- 整份报告基于**同一次当前状态快照**（同一读事务）并携带 `revision`；
+  报告**只读**：不校验角色、不改变开关、许可、修订号或审计。
+- 浏览器在“检修许可”页的“单点挂牌失效风险”面板中可勾选要检查的许可
+  （默认全部）、生成报告，并点击任一带电路径在供电网络图中高亮。
+
 ### 多设备协同隔离与整组许可
 同一检修班组一次为多台设备取得许可时，操作员可按**设备编号集合**请求协同隔离方案：
 
@@ -230,7 +247,10 @@ cp .env.example .env
 4. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
    路径数量 / 长度超过诊断上限时，弹窗与许可卡片会用黄色提示标记“仅展示部分
    路径”，但拒绝结论基于完整可达性分析，不受上限影响。有效许可卡片实时显示
-   隔离是否满足，可随时结束许可。
+   隔离是否满足，可随时结束许可。页面下方的“单点挂牌失效风险”面板可勾选要
+   检查的许可（默认全部）并生成报告：逐已挂牌开关假设其挂牌失效，红色条目
+   列出将失去隔离的许可与一条真实带电路径（点击可在网络图中高亮），绿色
+   条目为无单点风险的开关；报告携带所依据修订号，只读不改状态。
 5. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
 6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
@@ -260,6 +280,7 @@ cp .env.example .env
 | GET | `/api/health` | - | 健康检查 |
 | GET | `/api/devices/:id/paths` | - | 设备供电路径诊断（限量展示未切断 / 被挂牌切断路径，触顶时 `truncated` 标记截断；`isolated` 以完整可达性分析为准） |
 | GET | `/api/devices/:id/isolation-advice` | - | **隔离建议**（只读）：基于当前修订号求最少新增挂牌开关与先分闸再挂牌步骤；已隔离返回空步骤；无开关来电通路返回 `422 ISOLATION_INFEASIBLE` + 真实带电路径；超步数上限时 `withinOrderLimit:false` 且步骤不截断 |
+| POST | `/api/permits/tag-risk` | - | **单点挂牌失效风险报告**（只读）`{permit_ids?:[...]}`：逐挂牌开关假设失效后检查有效许可的未切断通路，附真实带电路径；省略 `permit_ids` 检查全部有效许可 |
 | POST | `/api/isolation-group/plan` | - | **多设备协同方案**（只读）`{device_ids:[...]}`：返回共用开关、必要分闸挂牌步骤、许可数、总步数和所据修订号；任一目标无开关可切断时 `422` |
 | POST | `/api/isolation-group/preview` | operator | 多设备协同方案**预演**（只读，不校验/改变修订号）`{device_ids:[...]}` |
 | POST | `/api/isolation-group/confirm` | operator | 多设备协同隔离与全部许可**一次确认**（原子，revision +1，一条审计）`{device_ids:[...]}` |
@@ -397,6 +418,45 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 若期间修订号被他人推进，建议面板出现黄色 **STALE** 提示并禁用确认，
 需“清除建议”后对当前状态重新获取——系统不会自动套用新方案。
 
+#### 单点挂牌失效风险报告 API 示例
+
+```bash
+# 1) 检查全部有效许可(省略 permit_ids); 只读, 无需 actor/role/revision
+curl -s -X POST http://localhost:3000/api/permits/tag-risk \
+  -H 'Content-Type: application/json' -d '{}'
+# -> 200 { ok:true, kind:"permit.tagRisk", revision:6,
+#         permit_ids:[1], permits:[{permit_id:1,device_id:6,device_name:"1#循环水泵"}],
+#         taggedSwitchCount:2, riskCount:2,
+#         switches:[
+#           { switch_id:3, name:"进线开关K1", risks:[
+#             { permit_id:1, device_id:6, device_name:"1#循环水泵",
+#               livePath:{ nodes:[{id:1,...,"1#主电源"},{id:3,...},{id:5,...},{id:6,...}],
+#                          edges:[1,3,5] } } ] },   # 假设 K1 挂牌失效后的真实带电路径
+#           { switch_id:4, name:"备用开关K2", risks:[ ... ] } ] }
+# 已挂牌但不影响任何所查许可的开关同样列出: { switch_id:5, name:"联络开关K3", risks:[] }
+
+# 2) 只检查指定许可(可多个, 顺序无关, 结果按许可编号排序)
+curl -s -X POST http://localhost:3000/api/permits/tag-risk \
+  -H 'Content-Type: application/json' -d '{"permit_ids":[2,1]}'
+
+# 3) 无有效许可时 -> 空报告
+# -> 200 { ok:true, kind:"permit.tagRisk", revision:1,
+#         permit_ids:[], permits:[], taggedSwitchCount:0, riskCount:0, switches:[] }
+
+# 4) 筛选参数校验
+#    {"permit_ids":[]}      -> 400 PERMIT_IDS_REQUIRED  (显式空组)
+#    {"permit_ids":[1,1]}   -> 400 PERMIT_IDS_DUPLICATE (重复)
+#    {"permit_ids":[0]}     -> 400 INVALID_PERMIT_ID    (非正整数)
+#    {"permit_ids":[999]}   -> 404 PERMIT_NOT_FOUND     (不存在或已结束的许可)
+# 报告为只读: 响应前后修订号、开关状态、许可与审计均不变。
+```
+
+浏览器中的用法：进入“检修许可”页的“单点挂牌失效风险”面板，默认检查全部
+有效许可，也可取消勾选只看部分许可；点击“生成风险报告”后按开关列出结论——
+红色卡片为该开关挂牌失效后将失去隔离的许可及一条真实带电路径（点击路径可在
+“供电网络”图中高亮），绿色卡片为无单点风险的开关。报告标注所依据的修订号；
+状态被他人推进后面板会提示报告已过期，需重新生成。
+
 #### 多设备协同隔离 API 示例
 
 ```bash
@@ -457,6 +517,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 │   ├── db.js               # SQLite 连接、表结构、演示数据
 │   ├── graph.js            # 完整可达性隔离判定(无上限) + 限量诊断路径枚举
 │   ├── advisor.js          # 单设备/多设备隔离建议: 最小新增挂牌点割(拆点 + Dinic)
+│   ├── tagrisk.js          # 单点挂牌失效风险: 逐挂牌开关假设失效的完整可达性分析
 │   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
 │   └── init-db.js          # 建库脚本(npm run init-db)
 ├── public/                 # 浏览器界面(原生 JS + SVG)
@@ -469,6 +530,8 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
     ├── advice.e2e.js       # 单设备隔离建议最少挂牌/空步骤/不可行/建议带入单据/409 回归
     ├── group.e2e.js        # 多设备协同方案/预演/一次确认/重复许可/不可行/单审计回归
     ├── advisor.test.js     # 单/多设备隔离建议单元测试(最小割、共用开关、无开关旁路等)
+    ├── tagrisk.test.js     # 单点挂牌失效风险单元测试(排序/空报告/超长链见证路径等)
+    ├── tagrisk.e2e.js      # 风险报告 HTTP 回归(筛选校验/真实路径/只读/空报告)
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
@@ -479,6 +542,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 # 单元测试(无需起服务, 无需数据库)
 npm run test:graph
 npm run test:advisor
+npm run test:tagrisk
 
 # 端到端冒烟(终端1 起服务, 终端2 跑测试; 使用独立 DB 避免污染演示库)
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
@@ -492,6 +556,9 @@ BASE=http://127.0.0.1:3100 node test/advice.e2e.js
 
 # 多设备协同回归(集合校验/共用开关/预演只读/整组许可/重复许可拒绝/不可行路径/单审计)
 BASE=http://127.0.0.1:3100 node test/group.e2e.js
+
+# 单点挂牌失效风险回归(筛选校验/逐开关假设失效/真实带电路径/只读/空报告)
+BASE=http://127.0.0.1:3100 node test/tagrisk.e2e.js
 
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js
@@ -516,3 +583,9 @@ node test/smoke.js                            # 终端2
 402 步超限不截断、结果确定性与自定义上限，共 42 项断言；`advice.e2e.js`
 另覆盖建议只读（不改修订号 / 审计）、带入预演确认、确认必须使用建议
 revision 与 409 STALE_REVISION，共 50 项断言。
+`tagrisk.test.js` 覆盖：逐挂牌开关假设失效的风险判定、串联挂牌互相挡住时
+无单点风险、未挂牌开关不出现、停用电源方向不产生风险、开关 / 许可稳定排序、
+空报告、>64 节点超长链仍给出真实见证路径（不依赖诊断展示上限）、输入不被
+修改，共 31 项断言；`tagrisk.e2e.js` 另覆盖筛选参数校验（空组 / 重复 /
+非正整数 / 非有效编号）、真实带电路径、报告只读（修订号 / 审计 / 开关 /
+许可均不变）、多许可排序与筛选、全部许可结束后空报告，共 51 项断言。
